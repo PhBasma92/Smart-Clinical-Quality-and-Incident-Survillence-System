@@ -1,0 +1,1041 @@
+{
+  "name": "Smart  clinical Quality & Incident Survillance System",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Layer 1: regex for structured identifiers.\n// Fast and deterministic, but blind to names in free text.\nconst patterns = {\n  SSN: /\\b\\d{3}-\\d{2}-\\d{4}\\b/g,\n  PHONE_EG: /\\b(?:\\+?20[ -]?|0)1[0125]\\d{8}\\b/g,\n  PHONE_INTL: /\\b(?:\\+?\\d{1,3}[ -]?)?\\(?\\d{3}\\)?[ -]?\\d{3}[ -]?\\d{4}\\b/g,\n  NATIONAL_ID_EG: /\\b[23]\\d{13}\\b/g,\n  EMAIL: /\\b[\\w.%+-]+@[\\w.-]+\\.[A-Za-z]{2,}\\b/g,\n  MRN: /\\bMRN[:# ]?\\s?\\d{6,10}\\b/gi,\n  DATE: /\\b\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}\\b/g,\n  IP: /\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b/g,\n  URL: /\\bhttps?:\\/\\/[^\\s]+/g,\n  ACCOUNT: /\\bACCT[:# ]?\\s?\\d{6,12}\\b/gi\n};\n\nconst out = [];\nfor (const item of $input.all()) {\n  const text = item.json.chatInput\n    || item.json.text\n    || item.json.body?.text\n    || '';\n\n  const spans = [];\n  for (const [type, re] of Object.entries(patterns)) {\n    for (const m of text.matchAll(re)) {\n      spans.push({\n        type,\n        start: m.index,\n        end: m.index + m[0].length,\n        value: m[0],\n        source: 'regex'\n      });\n    }\n  }\n\n  out.push({ json: {\n    request_id: item.json.request_id || $execution.id,\n    text,\n    spans\n  }});\n}\nreturn out;"
+      },
+      "id": "6d2fbe27-dac6-4d47-8207-89758f09e81b",
+      "name": "Regex detect",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1296,
+        -256
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:3000/analyze",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text:$('When chat message received').item.json.chatInput , language: 'en', score_threshold: 0.35 }) }}",
+        "options": {}
+      },
+      "id": "cf3e0606-a1ab-438e-907c-84c63c9fa5cf",
+      "name": "Presidio analyze",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1136,
+        -400
+      ],
+      "alwaysOutputData": true,
+      "notes": "Lower score_threshold catches more PHI at the cost of false positives (Veracity trade-off)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Get input data safely from previous nodes\nconst aiNode = $('OVR Analyzer').first()?.json || {};\nconst deidNode = $('De-identify').first()?.json || {};\nconst guardrailsNode = $('Guardrails').first()?.json || {};\n\n// 2. Get mapping dictionary\nconst mapping = deidNode.mapping || {};\n\n// 3. Extract answer text from AI Agent response\nlet answerText = \n    aiNode.output || \n    aiNode.text || \n    aiNode.response || \n    aiNode.message?.content || \n    JSON.stringify(aiNode);\n\n// 4. Replace tokens with original values\nif (mapping && typeof mapping === 'object') {\n    for (const [token, realVal] of Object.entries(mapping)) {\n        if (token && realVal) {\n            answerText = String(answerText).replaceAll(String(token), String(realVal));\n        }\n    }\n}\n\n// 5. Return the result\nreturn [{\n    request_id: guardrailsNode.request_id || 520,\n    reidentified: true,\n    answer: answerText,\n    tokens_in_mapping: Object.keys(mapping).length\n}];"
+      },
+      "id": "591595d8-bacc-4f26-8794-44d5e4d33234",
+      "name": "Re-identify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        576,
+        -512
+      ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseMode": "responseNodes"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -2352,
+        -112
+      ],
+      "id": "7004950c-a7ee-4517-a66c-408b269ccc77",
+      "name": "When chat message received",
+      "webhookId": "6185f252-31c2-444e-8bb3-550a97a9ea72"
+    },
+    {
+      "parameters": {
+        "jsCode": "// De-identification node.\n// Inputs: spans from the regex node + entities from the Presidio node.\n// Token format: [TYPE_<timeCode>_<rand>]\nconst REGEX_NODE = 'Regex detect';\nconst PRESIDIO_NODE = 'Presidio analyze';\n\n// --- Input 1: regex node (carries the original text and its spans) ---\nconst base = $(REGEX_NODE).first().json;\nconst text = base.text || '';\nconst regexSpans = (base.spans || []).map(s => ({ ...s, source: 'regex', score: s.score ?? 1 }));\n\n// --- Input 2: Presidio node ---\n// The HTTP Request node may hand back one item holding an array,\n// or one item per entity. Handle both, and fall back to $input.\nlet presidioItems;\ntry {\n  presidioItems = $(PRESIDIO_NODE).all().map(i => i.json);\n} catch (e) {\n  presidioItems = $input.all().map(i => i.json);\n}\n\nlet rawEntities = [];\nif (presidioItems.length === 1 && Array.isArray(presidioItems[0])) {\n  rawEntities = presidioItems[0];\n} else if (presidioItems.length === 1 && Array.isArray(presidioItems[0]?.results)) {\n  rawEntities = presidioItems[0].results;\n} else {\n  rawEntities = presidioItems.filter(x => x && x.entity_type);\n}\n\nconst nerSpans = rawEntities\n  .filter(r => typeof r.start === 'number' && typeof r.end === 'number')\n  .map(r => ({\n    type: r.entity_type,\n    start: r.start,\n    end: r.end,\n    value: text.slice(r.start, r.end),\n    source: 'presidio',\n    score: r.score\n  }));\n\n// --- Merge both layers, drop overlaps ---\nconst all = [...regexSpans, ...nerSpans].sort(\n  (a, b) => a.start - b.start\n    || (b.end - b.start) - (a.end - a.start)\n    || (b.score || 1) - (a.score || 1)\n);\n\nconst merged = [];\nfor (const s of all) {\n  if (!merged.length || s.start >= merged[merged.length - 1].end) merged.push(s);\n}\n\n// --- Time-coded random tokens ---\nconst issuedAt = Date.now();\nconst timeCode = issuedAt.toString(36).toUpperCase();\nlet counter = 0;\nconst randomSuffix = () => {\n  counter++;\n  const a = Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');\n  const b = (issuedAt ^ (counter * 0x9e3779b1)).toString(16).slice(-4);\n  return (a + b).toUpperCase().slice(0, 6);\n};\n\n// One token per distinct value, so repeated mentions stay linked.\nconst byValue = new Map();\nconst mapping = {};\nconst identifiers = [];\n\nfor (const s of merged) {\n  const dedupeKey = s.type + '|' + s.value.trim().toLowerCase().replace(/\\s+/g, ' ');\n  if (!byValue.has(dedupeKey)) {\n    const token = `[${s.type}_${timeCode}_${randomSuffix()}]`;\n    byValue.set(dedupeKey, token);\n    mapping[token] = s.value;\n    identifiers.push({\n      token,\n      entity_type: s.type,\n      detected_by: s.source,\n      score: s.score,\n      issued_at: new Date(issuedAt).toISOString(),\n      occurrences: 1\n    });\n  } else {\n    identifiers.find(x => x.token === byValue.get(dedupeKey)).occurrences++;\n  }\n  s.token = byValue.get(dedupeKey);\n}\n\n// Replace right-to-left so earlier offsets stay valid.\nlet deidentified = text;\nfor (let i = merged.length - 1; i >= 0; i--) {\n  const s = merged[i];\n  deidentified = deidentified.slice(0, s.start) + s.token + deidentified.slice(s.end);\n}\n\nconst counts = merged.reduce((acc, s) => { acc[s.type] = (acc[s.type] || 0) + 1; return acc; }, {});\n\nreturn [{ json: {\n  request_id: base.request_id || $execution.id,\n  mode: 'tokenize',\n  reversible: true,\n  issued_at: new Date(issuedAt).toISOString(),\n  time_code: timeCode,\n  expires_at: new Date(issuedAt + 300000).toISOString(),\n  deidentified_text: deidentified,\n  identifiers,\n  mapping,\n  entity_counts: counts,\n  detected_by_regex: regexSpans.length,\n  detected_by_presidio: nerSpans.length,\n  dropped_as_overlap: (regexSpans.length + nerSpans.length) - merged.length,\n  total_entities: merged.length,\n  distinct_entities: Object.keys(mapping).length,\n  recognizers: [...new Set(merged.map(s => s.source))]\n}}];"
+      },
+      "id": "fa4813c1-2c1c-40cd-b0a7-524f32177b82",
+      "name": "De-identify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -960,
+        -432
+      ],
+      "notes": "Mapping never leaves this workflow run. For async, encrypt and store in Redis with TTL <= 300 s."
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [
+        -336,
+        80
+      ],
+      "id": "7988d831-c174-44f1-968b-6e2d121a47da",
+      "name": "Simple Memory"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-flash-lite-latest",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -880,
+        96
+      ],
+      "id": "4b475287-e580-4df2-bc3a-75b14655e129",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "KZdw8osQFmVS9LJk",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "message": "={{ $json.answer }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chat",
+      "typeVersion": 1.3,
+      "position": [
+        768,
+        -176
+      ],
+      "id": "3a62948e-dfbd-4a43-9b61-d09f082e244c",
+      "name": "Chat",
+      "webhookId": "e34d0ad3-50c2-4c16-8234-78a4fa72663f",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.output }}",
+        "guardrails": {
+          "topicalAlignment": {
+            "value": {
+              "threshold": 0.9,
+              "prompt": "You are a healthcare quality and patient safety escalation guardrail for an OVR system adhering to GAHAR and JCI standards.\n\nYour task is to check if the input OVR incident represents a High Risk or Escalation Required event.\n\nA text VIOLATES this policy if:\n1. \"severity_level\" is \"High\" or \"Critical\".\n2. \"is_sentinel_event\" is true.\n3. The incident involves severe harm, death, or immediate escalation required.\n\nIf the incident is Medium or Low severity and NOT a sentinel event, it complies with the policy."
+            }
+          }
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.guardrails",
+      "typeVersion": 2,
+      "position": [
+        48,
+        -416
+      ],
+      "id": "df789d5d-6f1e-4e31-81e1-6c6bcf326b13",
+      "name": "Guardrails"
+    },
+    {
+      "parameters": {
+        "chatId": "6907488110",
+        "text": "=🚨 High-Priority Clinical Alert\n\n{{ $json.output || $json.text || $json.message }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        448,
+        80
+      ],
+      "id": "62003cf7-f0d2-4f37-950d-161f303a13fc",
+      "name": "Send a text message1",
+      "webhookId": "317a1182-0e92-4143-9ef6-268e83538240",
+      "credentials": {
+        "telegramApi": {
+          "id": "pMO09YpUSwmaOM3c",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-flash-lite-latest",
+          "mode": "list",
+          "cachedResultName": "models/gemini-flash-lite-latest"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an expert AI Healthcare Router and Medical Incident Classifier.\nAnalyze the input text above carefully and route it to the correct specialized clinical workflow.\n\nRULES FOR CLASSIFICATION:\n1. Accept ONLY text related to the medical field, healthcare operations, patient care, medical errors, hospital facilities, or OVR safety incidents.\n2. REJECT any input that is general conversation, non-medical, or spam.\n\nDETERMINE THE ROUTE:\n- \"OVR\": If the input is an occurrence variance report, patient fall, clinical incident, equipment failure, or safety violation.\n- \"DRUG_REC\": If the input is about medication reconciliation, prescription checking, drug-drug interaction screening, or discharge medication review.\n- \"REJECT\": If the input is general, non-medical, or unrelated.\n\nRespond ONLY with a JSON object in this exact format:\n{\n  \"route\": \"OVR\", // Choose either \"OVR\", \"DRUG_REC\", or \"REJECT\"\n  \"is_medical\": true,\n  \"reason\": \"Brief reason for this routing decision\"\n}\nInput text to analyze:\n{{ $json.chatInput }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        -2080,
+        -96
+      ],
+      "id": "7ee161ee-9ef6-4adf-ae0a-f2f93dee5a59",
+      "name": "Message a model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "KZdw8osQFmVS9LJk",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "command-a-plus-05-2026",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatCohere",
+      "typeVersion": 1,
+      "position": [
+        -432,
+        976
+      ],
+      "id": "fdc5005b-b93c-4779-b69e-8a9ea5dce8db",
+      "name": "Cohere Chat Model",
+      "credentials": {
+        "cohereApi": {
+          "id": "aeQgY2AUS4KWzxH7",
+          "name": "Cohere account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "Searches official FDA drug labeling for medication safety information, including drug interaction warnings, contraindications, warnings, and precautions.\n\nUse this tool when medication safety information needs to be verified against FDA-approved labeling.\n\nThe tool provides evidence from drug labeling. It does NOT independently confirm that two medications interact.\n\nNever interpret the presence of a medication name in a label as proof of a drug-drug interaction.\n\nAlways distinguish between:\n\n- Confirmed information stated in the FDA label\n- Potential safety concerns\n- Information that requires further clinical verification\n\nNever use this tool alone to make a treatment decision",
+        "url": "https://api.fda.gov/drug/label.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('parameters0_Value', `Create an openFDA search query for the medication or medications being checked. Search specifically within the drug_interactions field. Use generic medication names when possible.`, 'string') }}"
+            },
+            {
+              "name": "limit",
+              "value": "=3"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.5,
+      "position": [
+        48,
+        1056
+      ],
+      "id": "67a5e967-d422-41e5-bbcd-090b700eebbe",
+      "name": "drug_drug-interaction_tool"
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.output }}",
+        "guardrails": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.guardrails",
+      "typeVersion": 2,
+      "position": [
+        288,
+        576
+      ],
+      "id": "13186077-cd91-4107-b0b5-3c4d29f5c600",
+      "name": "Guardrails1"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.3,
+      "position": [
+        -112,
+        1072
+      ],
+      "id": "8715f820-2082-4c6b-8a13-d52033e37245",
+      "name": "Code Tool"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -1456,
+        944
+      ],
+      "id": "d4bc5dd7-45f6-4d6a-bf91-d846473b50bb",
+      "name": "Google Gemini Chat Model1",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "KZdw8osQFmVS9LJk",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "message": "={{ $json.guardrailsInput }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chat",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        544
+      ],
+      "id": "29437a56-dd8c-4b38-95aa-f9fda38fed85",
+      "name": "Chat1",
+      "webhookId": "73c71d87-4d56-4218-aab9-d56b7cd23b4d"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -576,
+        944
+      ],
+      "id": "e961b3f8-37fc-47e1-b784-6e21a854d896",
+      "name": "Google Gemini Chat Model2",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "KZdw8osQFmVS9LJk",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [
+        -304,
+        1056
+      ],
+      "id": "78a0c8ad-06e8-4bbd-a537-527fac0472c8",
+      "name": "Simple Memory1"
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.chatInput }}",
+        "guardrails": {
+          "keywords": "",
+          "jailbreak": {
+            "value": {
+              "threshold": 0.7
+            }
+          }
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.guardrails",
+      "typeVersion": 2,
+      "position": [
+        -1312,
+        560
+      ],
+      "id": "5b7b5b63-b9d8-43e7-84e3-2a84e03f1c74",
+      "name": "Guardrails2"
+    },
+    {
+      "parameters": {
+        "message": "={{ $json.output }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chat",
+      "typeVersion": 1.3,
+      "position": [
+        -960,
+        976
+      ],
+      "id": "66cd4def-cfc5-43f9-a519-6ccd9e17553f",
+      "name": "Chat2",
+      "webhookId": "8ba15c1d-1ab8-4332-8aa9-bd274335be35"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "OVR",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "fd6bfde5-8108-48de-931f-e88afe80a945"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "70775981-1ff6-43c7-ac4b-21aa374dc57b",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "DRUG_REC",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -1488,
+        -80
+      ],
+      "id": "b2466b9a-74e2-4b0c-a4cb-62bb3718f862",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the text coming from the Message a model node\nconst jsonText = $input.item.json.content.parts[0].text;\n\n// Clean any markdown formatting tags if present\nconst cleanText = jsonText.replace(/```json/g, '').replace(/```/g, '').trim();\n\n// Parse the text into a real JSON object\nconst parsedData = JSON.parse(cleanText);\n\n// Return the parsed data to the next node (If node)\nreturn { json: parsedData };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1712,
+        -80
+      ],
+      "id": "7740f586-97b7-4fd0-ab5d-8e7ed7938d99",
+      "name": "clean_json_output"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.deidentified_text || $node[\"When chat message received\"].json.chatInput }}\n",
+        "options": {
+          "systemMessage": "You are an expert Healthcare Quality and Patient Safety Director, specialized in GAHAR and JCI accreditation standards for Occurrence Variance Report (OVR) analysis.\n\nYour task is to analyze the incoming clinical incident report thoroughly and return a structured JSON output.\n\nPlease follow these strict classification rules:\n\n1. INCIDENT CATEGORIES:\nClassify the event into one of these standard clinical types:\n- Medication/IV Fluid Error\n- Patient Fall & Mobility Incident\n- Surgical/Procedural Adverse Event\n- Healthcare-Associated Infection (HAI)\n- Equipment/Device Failure\n- Clinical Communication & Handover Error\n\n2. SEVERITY LEVELS & SCORING:\n- \"Low\" (Score: 0.1 - 0.3): Near miss or minor incident with no patient harm and no increased monitoring required.\n- \"Medium\" (Score: 0.4 - 0.6): Temporary harm requiring minimal medical intervention or extended observation.\n- \"High\" (Score: 0.7 - 0.85): Severe temporary harm, major intervention required, or significant clinical impact.\n- \"Critical\" (Score: 0.86 - 1.0): Permanent patient harm, near-death event, or patient demise.\n\n3. SENTINEL EVENT CRITERIA (is_sentinel_event):\nSet to true ONLY if the event involves:\n- Unanticipated death or major permanent loss of function.\n- Wrong-site, wrong-procedure, or wrong-patient surgery/intervention.\n- Severe medication reaction leading to code blue or resuscitation.\n- Any critical event requiring immediate mandatory root cause analysis (RCA).\nOtherwise, set to false.\n\n4. ROOT CAUSE ANALYSIS (RCA):\nProvide a concise professional clinical analysis identifying the underlying system failures, human factors, or protocol breakdowns.\n\n5. CORRECTIVE & PREVENTIVE ACTIONS (CAPA):\nProvide clear, actionable, and structured CAPA recommendations tailored to prevent recurrence, referencing safety protocols or double-check barriers.\n\nYou MUST return a valid JSON object with these exact keys:\n{\n  \"incident_time\": \"string\",\n  \"department\": \"string\",\n  \"incident_category\": \"string\",\n  \"severity_level\": \"string\",\n  \"gahar_standard\": \"string\",\n  \"RCA_Summary\": \"string\",\n  \"CAPA_status\": \"string\",\n  \"AI_confidence\": \"string\",\n  \"severity_score\": number,\n  \"is_sentinel_event\": boolean\n}",
+          "tracingMetadata": {
+            "values": [
+              {
+                "key": "project",
+                "stringValue": "ovr_Project"
+              }
+            ]
+          }
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -736,
+        -640
+      ],
+      "id": "3b23ef9c-784b-4079-bba6-42cda5efdf3a",
+      "name": "OVR Analyzer"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        368,
+        -192
+      ],
+      "id": "c3a6fbf5-e572-419b-b093-05c0857dc6ba",
+      "name": "Limit"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1xj8YxQA80cgELmxsWAz1aiDkkjO0Ry3ZhmVvbyoRx0Q",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "Incident_Time": "={{ $now.format('2026-MM-DD HH:mm:ss') }}",
+            "Department": "=",
+            "incident_category": "=",
+            "CAPA_status": "="
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Incident_Time",
+              "displayName": "Incident_Time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Department",
+              "displayName": "Department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_category",
+              "displayName": "incident_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "severity_level",
+              "displayName": "severity_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "gahar_standard",
+              "displayName": "gahar_standard",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "RCA_summary",
+              "displayName": "RCA_summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "CAPA_status",
+              "displayName": "CAPA_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "AI_confidence",
+              "displayName": "AI_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "output",
+              "displayName": "output",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "incident_time",
+              "displayName": "incident_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "department",
+              "displayName": "department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "RCA_Summary",
+              "displayName": "RCA_Summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "severity_score",
+              "displayName": "severity_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "is_sentinel_event",
+              "displayName": "is_sentinel_event",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -144,
+        -464
+      ],
+      "id": "7346a68a-e970-4fcd-9782-32bd453c504c",
+      "name": "OVR_analytics_DB_Writer",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "l2p8Itggl6JiiLqY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(item => {\n  let jsonOutput = item.json.output || item.json.text || item.json.message || item.json;\n  \n  // If the output is wrapped as a JSON string, parse it\n  if (typeof jsonOutput === 'string') {\n    try {\n      let start = jsonOutput.indexOf('{');\n      let end = jsonOutput.lastIndexOf('}');\n      if (start !== -1 && end !== -1) {\n        jsonOutput = JSON.parse(jsonOutput.substring(start, end + 1));\n      } else {\n        jsonOutput = JSON.parse(jsonOutput);\n      }\n    } catch(e) {\n      jsonOutput = {};\n    }\n  }\n\n  // Map and normalize fields to ensure exact alignment with Google Sheets columns\n  return {\n    json: {\n      incident_time: jsonOutput.incident_time || \"\",\n      department: jsonOutput.department || \"\",\n      incident_category: jsonOutput.incident_category || \"\",\n      severity_level: jsonOutput.severity_level || \"\",\n      gahar_standard: jsonOutput.gahar_standard || \"\",\n      RCA_Summary: jsonOutput.RCA_Summary || jsonOutput.root_cause_analysis || \"\",\n      CAPA_status: jsonOutput.CAPA_status || jsonOutput.capa_recommendations || \"\",\n      AI_confidence: jsonOutput.AI_confidence || \"\",\n      severity_score: jsonOutput.severity_score || 0,\n      is_sentinel_event: jsonOutput.is_sentinel_event || false\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        -640
+      ],
+      "id": "b8e0b179-3f62-411f-af3b-32dd6692cb3b",
+      "name": "extract_ovr_fields"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('When chat message received').first().json.chatInput }}",
+        "needsFallback": true,
+        "options": {
+          "systemMessage": "You are a Medication Safety AI Agent specialized in identifying potential drug-drug interactions.\n\nYour main responsibility is to analyze medications provided by the user and check for potential interactions using the available Medication Safety Checker tool.\n\nInstructions:\n1. Identify all medications mentioned by the user.\n2. If the medication names are unclear, ask the user to clarify them.\n3. Always use the Medication Safety Checker tool when checking for drug-drug interactions. Do not rely only on your own knowledge.\n4. Do not invent or assume interaction information if the tool does not provide it.\n5. Clearly report:\n   - The medications involved\n   - Whether an interaction was identified\n   - The severity or clinical significance, if available\n   - The potential clinical effect\n   - Any precautions or recommended action provided by the source\n6. If no interaction is found, clearly state that no interaction was identified by the tool.\n7. Distinguish between a confirmed interaction and insufficient information.\n8. Do not provide a definitive diagnosis or replace a physician or pharmacist's clinical judgment.\n9. For high-risk or clinically significant interactions, clearly advise the user to consult a healthcare professional before changing or stopping any medication.\n10. Keep responses concise, clear, and clinically professional.\n\nWhen the user asks about drug interactions, prioritize the information retrieved from the Medication Safety Checker tool over unsupported assumptions."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -480,
+        544
+      ],
+      "id": "3f59e566-a2eb-409e-8757-510f77ef6907",
+      "name": "Med-Reconc Agent"
+    },
+    {
+      "parameters": {
+        "chatId": "6907488110",
+        "text": "=🚨 CRITICAL DRUG RECONCILIATION ALERT 🚨 -------------------------------------------------- 🏥 System: Smart Clinical Quality Surveillance 🤖 Agent: Med-Recon Agent 👤 Patient ID: {{ $json.patient_id }}  ⚠️ Status: NON-COMPATIBLE / CRITICAL VARIANCE • Alert Details: Severe drug interaction detected between current home medications and new prescriptions.  👨‍⚕️ ACTION REQUIRED: 1. Hold prescription finalization. 2. Mandatory Human-in-the-Loop clinical review.  📊 LangSmith Traced Severity: CRITICAL",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        496,
+        832
+      ],
+      "id": "f624e2b1-9701-47c2-867e-50cb64961948",
+      "name": "Send a text message",
+      "webhookId": "e0c4680e-3d41-466e-b48b-3f451143a8b9",
+      "credentials": {
+        "telegramApi": {
+          "id": "pMO09YpUSwmaOM3c",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Regex detect": {
+      "main": [
+        [
+          {
+            "node": "Presidio analyze",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Presidio analyze": {
+      "main": [
+        [
+          {
+            "node": "De-identify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-identify": {
+      "main": [
+        [
+          {
+            "node": "Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "De-identify": {
+      "main": [
+        [
+          {
+            "node": "OVR Analyzer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "OVR Analyzer",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "OVR Analyzer",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "Guardrails",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrails": {
+      "main": [
+        [
+          {
+            "node": "Re-identify",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "clean_json_output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cohere Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Med-Reconc Agent",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "drug_drug-interaction_tool": {
+      "ai_tool": [
+        [
+          {
+            "node": "Med-Reconc Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrails1": {
+      "main": [
+        [
+          {
+            "node": "Chat1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code Tool": {
+      "ai_tool": [
+        [
+          {
+            "node": "Med-Reconc Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Guardrails2",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Med-Reconc Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "Med-Reconc Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrails2": {
+      "main": [
+        [
+          {
+            "node": "Med-Reconc Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Chat2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Regex detect",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Guardrails2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "clean_json_output": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OVR Analyzer": {
+      "main": [
+        [
+          {
+            "node": "extract_ovr_fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit": {
+      "main": [
+        [
+          {
+            "node": "Send a text message1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OVR_analytics_DB_Writer": {
+      "main": [
+        [
+          {
+            "node": "Guardrails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "extract_ovr_fields": {
+      "main": [
+        [
+          {
+            "node": "OVR_analytics_DB_Writer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Med-Reconc Agent": {
+      "main": [
+        [
+          {
+            "node": "Guardrails1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "956dddff-6453-4e69-bbac-583b9ad606df",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "07636d167991ebbc658c43c867d460a7a1a570712ceb94a0f865e5a88c90f2cd"
+  },
+  "nodeGroups": [],
+  "id": "AjK8CuGoN0Fblqes",
+  "tags": []
+}
